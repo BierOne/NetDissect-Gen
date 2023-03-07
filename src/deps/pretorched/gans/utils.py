@@ -163,7 +163,7 @@ class Distribution(torch.Tensor):
 def prepare_z_y(G_batch_size, dim_z, nclasses, device='cuda',
                 fp16=False, z_var=1.0):
     """Convenience function to prepare a z and y vector."""
-    z_ = Distribution(torch.randn(G_batch_size, dim_z, requires_grad=False))
+    z_ = Distribution(torch.randn(G_batch_size, *dim_z, requires_grad=False))
     z_.init_distribution('normal', mean=0, var=z_var)
     z_ = z_.to(device, torch.float16 if fp16 else torch.float32)
 

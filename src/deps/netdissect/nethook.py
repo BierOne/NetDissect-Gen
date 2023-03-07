@@ -28,10 +28,18 @@ class InstrumentedModel(torch.nn.Module):
     ```
     '''
 
-    def __init__(self, model):
+    def __init__(self, model, retain_list=False, save_interval=None, max_step=20):
         super().__init__()
         self.model = model
+
+        self.retain_list = retain_list
+        self.save_interval = save_interval  # for save intermediate output in diffusion process
+
+        # this is to align with the ddim step calculation
+        self.current_step = self.max_step = max_step - 1  # for save specific step in diffusion process
+
         self._retained = OrderedDict()
+
         self._detach_retained = {}
         self._editargs = defaultdict(dict)
         self._editrule = {}
@@ -74,7 +82,7 @@ class InstrumentedModel(torch.nn.Module):
             if not isinstance(aka, str):
                 layername, aka = layername
             if aka not in self._retained:
-                self._retained[aka] = None
+                self._retained[aka] = [] if self.retain_list else None
                 self._detach_retained[aka] = detach
 
     def stop_retaining_layers(self, layernames):
@@ -97,7 +105,7 @@ class InstrumentedModel(torch.nn.Module):
         result = OrderedDict(self._retained)
         if clear:
             for k in result:
-                self._retained[k] = None
+                self._retained[k] = [] if self.retain_list else None
         return result
 
     def retained_layer(self, aka=None, clear=False):
@@ -111,7 +119,8 @@ class InstrumentedModel(torch.nn.Module):
             aka = next(self._retained.keys().__iter__())
         result = self._retained[aka]
         if clear:
-            self._retained[aka] = None
+            self._retained[aka] = [] if self.retain_list else None
+            self.current_step = self.max_step
         return result
 
     def edit_layer(self, layername, rule=None, **kwargs):
@@ -196,8 +205,14 @@ class InstrumentedModel(torch.nn.Module):
 
         def new_forward(self, *inputs, **kwargs):
             original_x = original_forward(*inputs, **kwargs)
-            x = editor._postprocess_forward(original_x, aka)
+            # print(original_x.shape)
+            if editor.retain_list:
+                x = editor._postprocess_forward_ldm(original_x, aka)
+                editor.current_step -= 1
+            else:
+                x = editor._postprocess_forward(original_x, aka)
             return x
+
         layer.forward = types.MethodType(new_forward, layer)
 
     def _unhook_layer(self, aka):
@@ -222,6 +237,30 @@ class InstrumentedModel(torch.nn.Module):
             layer.forward = old_forward
         del self._old_forward[layername]
         del self._hooked_layer[aka]
+
+    def _postprocess_forward_ldm(self, x, aka):
+        '''
+        The internal method called by the hooked layers after they are run.
+        '''
+        # Determine if we save intermediate output for this step
+        if self.save_interval is not None:
+            if ((self.current_step % self.save_interval) != 0) and \
+                    (self.current_step != self.max_step):
+                return x
+        # print(self.current_step, 'save hiddens')
+
+        # Retain output before edits, if desired.
+        if aka in self._retained:
+            if self._detach_retained[aka]:
+                self._retained[aka].append(x.detach())
+            else:
+                self._retained[aka].append(x)
+        # Apply any edits requested.
+        rule = self._editrule.get(aka, None)
+        if rule is not None:
+            x = invoke_with_optional_args(
+                rule, x, self, name=aka, **(self._editargs[aka]))
+        return x
 
     def _postprocess_forward(self, x, aka):
         '''
@@ -270,6 +309,7 @@ class InstrumentedModel(torch.nn.Module):
             assert first_layer is None, '%s not found' % first_layer
             assert last_layer is None, '%s not found' % last_layer
             return x
+
         model.forward = types.MethodType(new_forward, model)
 
     def close(self):

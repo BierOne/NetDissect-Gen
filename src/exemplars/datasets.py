@@ -27,6 +27,7 @@ KEYS = easydict.EasyDict(d=milannotations.KEYS)
 KEYS.IMAGENET_SPURIOUS_TEXT = 'imagenet-spurious-text'
 KEYS.IMAGENET_SPURIOUS_COLOR = 'imagenet-spurious-color'
 KEYS.BIGGAN_ZS_IMAGENET = 'biggan-zs-imagenet'
+KEYS.LDM_ZS_IMAGENET = 'diffusion-zs-imagenet'
 KEYS.BIGGAN_ZS_PLACES365 = 'biggan-zs-places365'
 
 
@@ -97,6 +98,10 @@ def default_dataset_configs(
             hubs.DatasetConfig(
                 TensorDatasetOnDisk,
                 url=f'{HOST}/{KEYS.BIGGAN_ZS_PLACES365}.zip',
+            ),
+        KEYS.LDM_ZS_IMAGENET:
+            hubs.DatasetConfig(
+                TensorDatasetOnDisk,
             ),
     }
     configs.update(others)

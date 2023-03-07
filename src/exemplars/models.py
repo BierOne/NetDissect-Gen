@@ -20,6 +20,8 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 from src import milannotations
 from src.deps import alexnet, resnet152
 from src.deps.ext.pretorched.gans import biggan
+from src.deps.ext.pretorched.ldms import ldm
+
 from src.deps.ext.torchvision import models
 from src.deps.netdissect import renormalize
 from src.exemplars import datasets, transforms
@@ -39,6 +41,12 @@ KEYS = easydict.EasyDict(d=milannotations.KEYS)
 LAYERS = easydict.EasyDict()
 LAYERS.ALEXNET = ('conv1', 'conv2', 'conv3', 'conv4', 'conv5')
 LAYERS.BIGGAN = ('layer0', 'layer1', 'layer2', 'layer3', 'layer4', 'layer5')
+
+
+
+LAYERS.LDM = (
+    f'model.diffusion_model.output_blocks.{index}.0' for index in (11, 6, 0))
+
 LAYERS.DENSENET121 = (
     'features.conv0',
     *(f'features.denseblock{index}' for index in range(1, 5)))
@@ -197,7 +205,7 @@ def default_model_configs(**others: ModelConfig) -> Mapping[str, ModelConfig]:
                     transform_hiddens=lambda hiddens: hiddens.h,
                     renormalizer=renormalize.renormalizer(target='byte'),
                     image_size=256,
-                    batch_size=20,
+                    batch_size=22,
                     dataset=datasets.KEYS.BIGGAN_ZS_IMAGENET,
                 ),
             ),
@@ -214,6 +222,19 @@ def default_model_configs(**others: ModelConfig) -> Mapping[str, ModelConfig]:
                     image_size=256,
                     batch_size=32,
                     dataset=datasets.KEYS.BIGGAN_ZS_PLACES365,
+                ),
+            ),
+        KEYS.LDM_IMAGENET:
+            ModelConfig(
+                ldm.LDM,
+                pretrained='imagenet',
+                load_weights=False,
+                layers=LAYERS.LDM,
+                exemplars=GenerativeModelExemplarsConfig(
+                    renormalizer=renormalize.renormalizer(target='byte'),
+                    image_size=256,
+                    batch_size=10,
+                    dataset=datasets.KEYS.LDM_ZS_IMAGENET,
                 ),
             ),
         KEYS.DENSENET121_IMAGENET:

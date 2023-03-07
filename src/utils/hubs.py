@@ -127,7 +127,10 @@ class ModelConfig:
 
             model.load_state_dict(state_dict)
 
-        return model.eval()
+        if hasattr(model, "eval"):
+            model.eval()
+
+        return model
 
 
 class ModelHub:

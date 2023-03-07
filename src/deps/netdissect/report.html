@@ -29,15 +29,28 @@
 .header a { text-decoration: underline; cursor: pointer; }
 </style>
 </head>
+
+
 <body>
 <div id="report" v-if="header && units">
 <div class="header">
   <h2>{{ header.name }}</h2>
   <img :src="header.image">
+
+  <div class="layer_info">
+    <span v-if="'interpretable' in header"
+    >{{header.interpretable}}/</span
+    >{{header.units_num}} units
+    <span v-if="'uncovered_concepts' in header">
+    covering {{header.uncovered_concepts}} concepts
+    with IoU &ge; {{header.iou_threshold}}
+    </span>
+    </div>
+
   <div>sort by:
     <a @click="sort_order = ['iou']; sort_dir = ['desc']"
       >iou</a>
-    <a @click="sort_order = ['label', 'iou']; sort_dir = ['asc', 'desc']" 
+    <a @click="sort_order = ['label', 'iou']; sort_dir = ['asc', 'desc']"
       >label</a>
     <a @click="sort_order = ['unit']; sort_dir = ['asc']"
       >unit</a>
@@ -59,11 +72,20 @@ var theapp = new Vue({
     header: null,
     units: null,
     sort_order: ['unit'],
-    sort_dir: ['desc']
+    sort_dir: ['desc'],
+    interpretable: null,
+    units_num: null,
+    uncovered_concepts: null,
+    iou_threshold: null,
+
   },
   created: function() {
     var self = this;
     $.getJSON('./report.json?' + Math.random(), function(d) {
+      self.interpretable = d.interpretable;
+      self.units_num = d.units_num;
+      self.uncovered_concepts = d.uncovered_concepts;
+      self.iou_threshold = d.iou_threshold;
       self.header = d.header;
       self.units= d.units;
     });
