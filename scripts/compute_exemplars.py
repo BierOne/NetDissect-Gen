@@ -3,7 +3,7 @@ import argparse
 import pathlib
 
 import torch
-from src.exemplars import compute, datasets, models
+from src.exemplars import datasets, models
 from src.utils import env
 
 from torch import cuda
@@ -52,8 +52,18 @@ parser.add_argument('--num-workers',
                     type=int,
                     default=16,
                     help='number of worker threads (default: 16)')
+parser.add_argument('--dissect',
+                    action='store_true',
+                    help='network dissection')
 parser.add_argument('--device', help='manually set device (default: guessed)')
 args = parser.parse_args()
+
+if args.dissect:
+    from src.exemplars import dissect_gen as compute
+else:
+    from src.exemplars import compute
+
+
 
 device = args.device or 'cuda' if cuda.is_available() else 'cpu'
 
@@ -61,13 +71,16 @@ model, layers, config = models.load(f'{args.model}/{args.dataset}',
                                     map_location=device,
                                     path=args.model_file)
 
-dataset, generative = args.dataset, False
+dataset, generative, diffusion = args.dataset, False, False
 if isinstance(config.exemplars, models.GenerativeModelExemplarsConfig):
     dataset = config.exemplars.dataset
     generative = True
 # TODO(evandez): Yuck, push this into config.
 elif dataset == datasets.KEYS.IMAGENET_BLURRED:
     dataset = datasets.KEYS.IMAGENET
+
+if 'ldm' in args.model:
+    diffusion = True
 
 dataset = datasets.load(dataset, path=args.dataset_path)
 print(len(dataset))
@@ -101,6 +114,18 @@ elif not args.no_viz:
 
 with torch.no_grad():
     for layer in layers:
+        if diffusion:
+            compute.diffusion(model,
+                            dataset,
+                            layer=layer,
+                            units=units,
+                            results_dir=results_dir,
+                            viz_dir=viz_dir,
+                            save_viz=not args.no_viz,
+                            device=device,
+                            num_workers=args.num_workers,
+                            **config.exemplars.kwargs)
+            continue
         if generative:
             compute.generative(model,
                             dataset,
@@ -124,5 +149,5 @@ with torch.no_grad():
                                 num_workers=args.num_workers,
                                 **config.exemplars.kwargs)
 
-if not args.no_link:
-    data_dir.symlink_to(results_dir, target_is_directory=True)
+# if not args.no_link:
+#     data_dir.symlink_to(results_dir, target_is_directory=True)

@@ -6,12 +6,13 @@ edgy, you can instead call `compute` directly, which only requires you
 pass an arbitrary function that computes activations given images.
 """
 import pathlib
-import shutil
+import shutil, os, inspect
 from typing import Any, Callable, Optional, Sequence, Tuple
 
+from src.deps import netdissect
 from src.deps.ext.netdissect import imgviz
 from src.deps.netdissect import (imgsave, nethook, pbar, renormalize, pidfile,
-                                 runningstats, tally, segmenter)
+                                 upsample, runningstats, tally, segmenter, bargraph)
 
 from src.exemplars import transforms
 from src.utils import env
@@ -56,12 +57,13 @@ def compute(compute_topk_and_quantile: Callable[..., TensorPair],
             compute_activations: imgviz.ComputeActivationsFn,
             dataset: data.Dataset,
             units: Optional[Sequence[int]] = None,
-            k: int = 15,
+            k: int = 5,
             quantile: float = 0.99,
             output_size: int = 224,
             batch_size: int = 128,
             image_size: Optional[int] = None,
             renormalizer: Optional[renormalize.Renormalizer] = None,
+            upfn: Optional[Any] = None,
             num_workers: int = 30,
             results_dir: Optional[PathLike] = None,
             viz_dir: Optional[PathLike] = None,
@@ -164,6 +166,12 @@ def compute(compute_topk_and_quantile: Callable[..., TensorPair],
     if not isinstance(viz_dir, pathlib.Path):
         viz_dir = pathlib.Path(viz_dir)
 
+    if tally_cache_file is None:
+        tally_cache_file = pidfile.exclusive_dirfn(results_dir)
+    else:
+        tally_cache_file = pidfile.exclusive_dirfn(tally_cache_file)
+
+
     # Clear cache files if requested.
     if clear_cache_files:
         for cache_file in (tally_cache_file, masks_cache_file):
@@ -204,15 +212,18 @@ def compute(compute_topk_and_quantile: Callable[..., TensorPair],
         _compute_topk_and_quantile = compute_topk_and_quantile
         _compute_activations = compute_activations
 
+    sample_size = 1000
+    # sample_size = len(dataset)
     # We always compute activation statistics across dataset.
     if display_progress:
         pbar.descnext('tally activations')
     topk, rq = tally.tally_topk_and_quantile(_compute_topk_and_quantile,
                                              dataset,
                                              k=k,
+                                             sample_size=sample_size,
                                              batch_size=batch_size,
                                              num_workers=num_workers,
-                                             cachefile=tally_cache_file)
+                                             cachefile=tally_cache_file('topk_rq.npz'))
 
     # Now compute top images and masks for the highest-activating pixels if
     # there is any reason to do so.
@@ -226,106 +237,110 @@ def compute(compute_topk_and_quantile: Callable[..., TensorPair],
                                      renormalizer=renormalizer,
                                      source=dataset,
                                      level=levels)
-        masked, images, masks = viz.individual_masked_images_for_topk(
+
+        unit_images = viz.masked_images_for_topk(
             _compute_activations,
             dataset,
             topk,
             k=k,
+            sample_size=sample_size,
             batch_size=batch_size,
             num_workers=num_workers,
-            cachefile=masks_cache_file)
-
-    if save_results:
-        assert images is not None
-        assert masks is not None
-
-        # Save the top images and masks in easily accessible numpy files.
-        if display_progress:
-            pbar.descnext('saving top images')
-        numpy.save(f'{results_dir}/images.npy', images)
-        numpy.save(f'{results_dir}/masks.npy', masks)
-
-        # Finally, save the IDs of all top images and the activation values
-        # associated with each unit and image.
-        activations, ids = topk.result()
-        for metadata, name, fmt in ((activations, 'activations', '%.5e'),
-                                    (ids, 'ids', '%i')):
-            metadata = metadata.view(len(images), k).cpu().numpy()
-            metadata_file = results_dir / f'{name}.csv'
-            numpy.savetxt(str(metadata_file), metadata, delimiter=',', fmt=fmt)
+            pin_memory=True,
+            cachefile=tally_cache_file('top%dimages.npz' % k))
 
     if save_viz:
-        assert masked is not None
+        pbar.descnext('saving images')
+        imgsave.save_image_set(unit_images, tally_cache_file('image/unit%d.jpg'),
+                               sourcefile=tally_cache_file('top%dimages.npz' % k))
 
-        # Now save the top images with the masks overlaid. We save each image
-        # individually so they can be visualized and/or shown on MTurk.
-        imgsave.save_image_set(masked,
-                               f'{viz_dir}/unit_%d/image_%d.png',
-                               sourcefile=masks_cache_file)
-
-        # The lightbox lets us view all the masked images at once. Handy!
-        lightbox_dir = pathlib.Path(__file__).parents[1] / 'deps'
-        lightbox_file = lightbox_dir / 'lightbox.html'
-        for unit in range(len(masked)):
-            unit_dir = viz_dir / f'unit_{unit}'
-            unit_lightbox_file = unit_dir / '+lightbox.html'
-            shutil.copy(lightbox_file, unit_lightbox_file)
+    #     masked, images, masks = viz.individual_masked_images_for_topk(
+    #         _compute_activations,
+    #         dataset,
+    #         topk,
+    #         k=k,
+    #         batch_size=batch_size,
+    #         num_workers=num_workers,
+    #         cachefile=masks_cache_file)
+    #
+    # if save_viz:
+    #     assert masked is not None
+    #     # Now save the top images with the masks overlaid. We save each image
+    #     # individually so they can be visualized and/or shown on MTurk.
+    #     imgsave.save_image_set(masked,
+    #                            f'{viz_dir}/unit_%d/image_%d.png',
+    #                            sourcefile=masks_cache_file)
+    #
+    #     # The lightbox lets us view all the masked images at once. Handy!
+    #     lightbox_dir = pathlib.Path(__file__).parents[1] / 'deps'
+    #     lightbox_file = lightbox_dir / 'lightbox.html'
+    #     for unit in range(len(masked)):
+    #         unit_dir = viz_dir / f'unit_{unit}'
+    #         unit_lightbox_file = unit_dir / '+lightbox.html'
+    #         shutil.copy(lightbox_file, unit_lightbox_file)
 
 
 
     # Compute IoU agreement between segmentation labels and every unit
     # Grab the 99th percentile, and tally conditional means at that level.
-    level_at_99 = rq.quantiles(percent_level).cuda()[None,:,None,None]
+    # export CUDA_HOME=/usr/local/cuda-11.1/
+    seg_name = 'netpqxc'
+    iou_threshold = 0.04
+    level_at_99 = rq.quantiles(quantile).cuda()[None,:,None,None]
     segmodel, seglabels, segcatlabels = load_segmenter('netpqc')
     renormalizer = renormalize.renormalizer(dataset, target='zc')
-    def compute_conditional_indicator(batch):
-        hiddens, images = tally.call_compute(compute_activations, batch)
+    def compute_conditional_indicator(*inputs: Any):
+        hiddens, images = compute_activations(*inputs)
         images = renormalizer(images)
         seg = segmodel.segment_batch(images, downsample=4)
-        iacts = (hiddens > level_at_99).float() # indicator
+        # print(images.shape, hiddens.shape)
+        hacts = upfn(hiddens)
+        iacts = (hacts > level_at_99).float() # indicator
         return tally.conditional_samples(iacts, seg)
     
     pbar.descnext('condi99')
     condi99 = tally.tally_conditional_mean(compute_conditional_indicator,
             dataset, sample_size=sample_size,
             num_workers=3, pin_memory=True,
-            cachefile=resfile('condi99.npz'))
+            cachefile=tally_cache_file('condi99.npz'))
 
     # Now summarize the iou stats and graph the units
     iou_99 = tally.iou_from_conditional_indicator_mean(condi99)
+
     unit_label_99 = [
             (concept.item(), seglabels[concept],
                 segcatlabels[concept], bestiou.item())
             for (bestiou, concept) in zip(*iou_99.max(0))]
+
+    print("number of neurons:", len(unit_label_99))
     labelcat_list = [labelcat
             for concept, label, labelcat, iou in unit_label_99
             if iou > iou_threshold]
-    save_conceptcat_graph(resfile('concepts_99.svg'), labelcat_list)
-    dump_json_file(resfile('report.json'), dict(
+    print("number of activated neurons (threshold=0.04):", len(labelcat_list))
+    print("covering {} concepts:".format(len(set(labelcat_list))))
+
+    save_conceptcat_graph(tally_cache_file('concepts_99.svg'), labelcat_list)
+    dump_json_file(tally_cache_file('report.json'), dict(
             header=dict(
-                name='%s %s %s' % (args.model, args.dataset, args.seg),
-                image='concepts_99.svg'),
+                name= "%s %s %s" % (str(results_dir), 'imagenet', seg_name),
+                image='concepts_99.svg',
+                interpretable=len(labelcat_list),
+                iou_threshold=iou_threshold,
+                units_num=len(unit_label_99),
+                uncovered_concepts=len(set(labelcat_list))
+            ),
             units=[
                 dict(image='image/unit%d.jpg' % u,
                     unit=u, iou=iou, label=label, cat=labelcat[1])
                 for u, (concept, label, labelcat, iou)
                 in enumerate(unit_label_99)])
             )
-    copy_static_file('report.html', resfile('+report.html'))
-    resfile.done();
-
+    copy_static_file('report.html', tally_cache_file('+report.html'))
+    # tally_cache_file.done();
 
     return topk, rq
 
 
-def dump_json_file(target, data):
-    with open(target, 'w') as f:
-        json.dump(data, f, indent=1, cls=FloatEncoder)
-
-def copy_static_file(source, target):
-    sourcefile = os.path.join(
-            os.path.dirname(inspect.getfile(netdissect)), source)
-    shutil.copy(sourcefile, target)
 
 
 def discriminative(
@@ -478,6 +493,19 @@ def generative(
     with nethook.InstrumentedModel(model) as instr:
         instr.retain_layer(layer, detach=False)
 
+        def make_upfn(*inputs: Any):
+            x, y = inputs
+            print(x.shape, y.shape)
+            inputs = (x[None, ...], y[None, ...])
+            prob_data = transform_inputs(*transforms.map_location(inputs, device))
+            out = model(*prob_data)
+            hidden = transform_hiddens(instr.retained_layer(layer))
+            print("hidden shape: {}, output img shape: {}".format(hidden.shape, out.shape))
+            return upsample.upsampler(
+                (64, 64),
+                data_shape=hidden.shape[2:],
+                image_size=out.shape[2:])
+
         def compute_topk_and_quantile(*inputs: Any) -> TensorPair:
             inputs = transform_inputs(*transforms.map_location(inputs, device))
             with torch.no_grad():
@@ -502,4 +530,233 @@ def generative(
                        dataset,
                        results_dir=results_dir,
                        viz_dir=viz_dir,
+                       upfn=make_upfn(*dataset[0]),
                        **kwargs)
+
+
+
+
+def diffusion(
+    sampler: Any,
+    dataset: data.Dataset,
+    layer: Layer,
+    ddim_steps: int = 20,
+    ddim_eta: float = 0.0,
+    scale: float = 3.0,
+    save_interval: int = 10,
+    device: Optional[Device] = None,
+    results_dir: Optional[PathLike] = None,
+    viz_dir: Optional[PathLike] = None,
+    transform_inputs: transforms.TransformToTuple = transforms.identities,
+    transform_hiddens: transforms.TransformToTensor = transforms.identity,
+    transform_outputs: transforms.TransformToTensor = transforms.identity,
+    **kwargs: Any,
+) -> ActivationStats:
+    """Compute exemplars for a difussion model of images.
+
+    That is, a model for which representation goes in, image comes out.
+    Because of the way these models are structured, we need both the generated
+    images and the intermediate activation.
+
+    Keyword arguments are forwarded to `compute`.
+
+    Args:
+        sampler (Any): ldm sampler.
+        dataset (data.Dataset): Dataset of representations used to generate
+            images. The top-activating images will be taken from them.
+        layer (Layer): Track unit activations for this layer.
+        ddim_steps: number of difussion steps
+        ddim_eta: ddim_eta for quality of generated images
+        scale: for unconditional guidance
+        device (Optional[Device], optional): Run all computations on this
+            device. Defaults to None.
+        results_dir (PathLike, optional): Directory to write results to.
+            If set, layer name will be appended to path. Defaults to same
+            as `run`.
+        viz_dir (Optional[PathLike], optional): Directory to write top image
+            visualizations to (e.g., individual png images, lightbox, etc.).
+            If set and layer is also set, layer name will be appended to path.
+            Defaults to same as `run`.
+        transform_inputs (transforms.TransformToTuple, optional): Pass batch
+            as *args to this function and use output as *args to model.
+            Defaults to identity, i.e. entire batch is passed to model.
+        transform_hiddens (transforms.TransformToTensor, optional): Pass output
+            of intermediate layer to this function and hand the result to
+            netdissect. This is useful if e.g. your model passes info between
+            layers as a dictionary or other non-Tensor data type.
+            Defaults to the identity function, i.e. the raw data will be
+            tracked by netdissect.
+        transform_outputs (transforms.TransformToTensor, optional): Pass output
+            of entire model, i.e. generated images, to this function and hand
+            result to netdissect. Defaults to identity function, i.e. the raw
+            data will be tracked by netdissect.
+
+    Returns:
+        ActivationStats: The top-k and quantile statistics for every unit.
+
+    """
+    if results_dir is not None:
+        results_dir = pathlib.Path(results_dir) / str(layer)
+    if viz_dir is not None:
+        viz_dir = pathlib.Path(viz_dir) / str(layer)
+
+    model = sampler.model
+    model.to(device)
+
+    num_classes = model.num_classes
+    cal_e_with_uncond = lambda e_t, e_t_uncond: e_t_uncond + scale * (e_t - e_t_uncond)
+    with nethook.InstrumentedModel(model, retain_list=True, save_interval=save_interval, max_step=ddim_steps) as instr:
+        instr.retain_layer(layer, detach=False)
+
+        def diffusion(*inputs: Any):
+            x_T, xc = inputs
+            img_num = x_T.shape[0]
+            # print(x_T.shape, xc.shape)
+            with model.ema_scope():
+                uc = model.get_learned_conditioning({model.cond_stage_key: torch.tensor(img_num * [num_classes]).cuda()})
+                c = model.get_learned_conditioning({model.cond_stage_key: xc.cuda()})
+
+                samples_ddim, intermediates = sampler.sample(S=ddim_steps, x_T=x_T.cuda(), conditioning=c,
+                                                             batch_size=img_num, shape=[3, 64, 64],
+                                                             verbose=False, log_every_t=save_interval,
+                                                             unconditional_guidance_scale=scale,
+                                                             unconditional_conditioning=uc,
+                                                             eta=ddim_eta)
+            return samples_ddim, intermediates
+
+        def decode_latents(samples_ddim):
+            samples_ddim = model.decode_first_stage(samples_ddim)
+            # samples_ddim = torch.clamp((samples_ddim + 1.0) / 2.0,
+            #                            min=0.0, max=1.0)
+            return samples_ddim
+
+        def compute_topk_and_quantile(*inputs: Any) -> TensorPair:
+            # here we stack the output of images, so there would be [saved_steps * batch_size, channels, w, h]
+            with torch.no_grad():
+                diffusion(*inputs)
+            hiddens = instr.retained_layer(layer, clear=True)  # only remaining conditional e_t
+            # hiddens = torch.cat([cal_e_with_uncond(*h_t.chunk(2)) for h_t in hiddens])
+            hiddens = [cal_e_with_uncond(*h_t.chunk(2)) for h_t in hiddens][-1]
+
+            batch_size, channels, *_ = hiddens.shape
+            activations = hiddens.permute(0, 2, 3, 1).reshape(-1, channels)
+            pooled, _ = hiddens.view(batch_size, channels, -1).max(dim=2)
+            return pooled, activations
+
+        def compute_activations(*inputs: Any) -> TensorPair:
+            # here we stack the output of images, so there would be [saved_steps * batch_size, channels, w, h]
+            with torch.no_grad():
+                images, intermediates = diffusion(*inputs)
+            # predict_imgs = torch.cat(
+                # intermediates['pred_x0'][1:])  # direct denoised output based on specific neuron out
+            predict_imgs = intermediates['pred_x0'][-1]  # direct denoised output based on specific neuron out
+            predict_imgs = decode_latents(predict_imgs)
+
+            hiddens = instr.retained_layer(layer, clear=True)  # only remaining conditional e_t
+            # hiddens = torch.cat([cal_e_with_uncond(*h_t.chunk(2)) for h_t in hiddens])
+            hiddens = [cal_e_with_uncond(*h_t.chunk(2)) for h_t in hiddens][-1]
+
+            return hiddens, predict_imgs
+
+        def make_upfn(*inputs: Any):
+            x, y = inputs
+            print(x.shape, y.shape)
+            inputs = (x[None, ...], y[None, ...])
+            hidden, out = compute_activations(*inputs)
+            print("hidden shape: {}, output img shape: {}".format(hidden.shape, out.shape))
+            return upsample.upsampler(
+                (64, 64),
+                data_shape=hidden.shape[2:],
+                image_size=out.shape[2:])
+
+        # if 'batch_size' in kwargs:
+        #     kwargs['batch_size'] = kwargs['batch_size'] * 3
+
+        return compute(compute_topk_and_quantile,
+                       compute_activations,
+                       dataset,
+                       results_dir=results_dir,
+                       viz_dir=viz_dir,
+                       upfn=make_upfn(*dataset[0]),
+                       **kwargs)
+
+
+
+
+
+
+
+
+import json
+from collections import defaultdict
+def graph_conceptcatlist(conceptcatlist, **kwargs):
+    count = defaultdict(int)
+    catcount = defaultdict(int)
+    for c in conceptcatlist:
+        count[c] += 1
+    for c in count.keys():
+        catcount[c[1]] += 1
+    cats = ['object', 'part', 'material', 'texture', 'color']
+    catorder = dict((c, i) for i, c in enumerate(cats))
+    sorted_labels = sorted(count.keys(),
+        key=lambda x: (catorder[x[1]], -count[x]))
+    sorted_labels
+    return bargraph.make_svg_bargraph(
+        [label for label, cat in sorted_labels],
+        [count[k] for k in sorted_labels],
+        [(c, catcount[c]) for c in cats], **kwargs)
+
+def save_conceptcat_graph(filename, conceptcatlist):
+    svg = graph_conceptcatlist(conceptcatlist, barheight=80, file_header=True)
+    with open(filename, 'w') as f:
+        f.write(svg)
+
+def dump_json_file(target, data):
+    with open(target, 'w') as f:
+        json.dump(data, f, indent=1, cls=FloatEncoder)
+
+def copy_static_file(source, target):
+    sourcefile = os.path.join(
+            os.path.dirname(inspect.getfile(netdissect)), source)
+    shutil.copy(sourcefile, target)
+
+
+
+
+
+class FloatEncoder(json.JSONEncoder):
+    def __init__(self, nan_str='"NaN"', **kwargs):
+        super(FloatEncoder, self).__init__(**kwargs)
+        self.nan_str = nan_str
+
+    def iterencode(self, o, _one_shot=False):
+        if self.check_circular:
+            markers = {}
+        else:
+            markers = None
+        if self.ensure_ascii:
+            _encoder = json.encoder.encode_basestring_ascii
+        else:
+            _encoder = json.encoder.encode_basestring
+        def floatstr(o, allow_nan=self.allow_nan,
+                _inf=json.encoder.INFINITY, _neginf=-json.encoder.INFINITY,
+                nan_str=self.nan_str):
+            if o != o:
+                text = nan_str
+            elif o == _inf:
+                text = '"Infinity"'
+            elif o == _neginf:
+                text = '"-Infinity"'
+            else:
+                return repr(o)
+            if not allow_nan:
+                raise ValueError(
+                    "Out of range float values are not JSON compliant: " +
+                    repr(o))
+            return text
+
+        _iterencode = json.encoder._make_iterencode(
+                markers, self.default, _encoder, self.indent, floatstr,
+                self.key_separator, self.item_separator, self.sort_keys,
+                self.skipkeys, _one_shot)
+        return _iterencode(o, 0)
